@@ -18,7 +18,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -50,9 +49,191 @@ type HabanalabsDevicePlugin struct {
 // guaranteed to be the allocation ultimately performed by the
 // devicemanager. It is only designed to help the devicemanager make a more
 // informed allocation decision when possible.
-// NOT Implemented
 func (m *HabanalabsDevicePlugin) GetPreferredAllocation(ctx context.Context, request *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
-	return nil, errors.New("GetPreferredAllocation should not be called as this device plugin doesn't implement it")
+	response := &pluginapi.PreferredAllocationResponse{}
+	for _, req := range request.ContainerRequests {
+		m.log.Info("GetPreferredAllocation called", "available_count", len(req.AvailableDeviceIDs), "requested_count", int(req.AllocationSize))
+
+		if req.AllocationSize <= 0 {
+			return nil, fmt.Errorf("invalid allocation size: %d, must be positive", req.AllocationSize)
+		}
+
+		// Get all available devices
+		availableDevices := make([]*pluginapi.Device, 0, len(req.AvailableDeviceIDs))
+		for _, id := range req.AvailableDeviceIDs {
+			device := getDevice(m.devs, id)
+			if device != nil {
+				availableDevices = append(availableDevices, device)
+			}
+		}
+
+		if len(availableDevices) < int(req.AllocationSize) {
+			return nil, fmt.Errorf("not enough available devices: requested %d, available %d",
+				req.AllocationSize, len(availableDevices))
+		}
+
+		// Group devices by NUMA node
+		numaDevices := groupDevicesByNuma(availableDevices)
+		m.log.Info("Devices grouped by NUMA", "numa_groups", len(numaDevices))
+
+		// Calculate total devices per NUMA node
+		totalDevicesPerNuma := make(map[int64]int)
+		allDevicesByNuma := groupDevicesByNuma(m.devs)
+		for numaID, devices := range allDevicesByNuma {
+			totalDevicesPerNuma[numaID] = len(devices)
+		}
+
+		// Find NUMA nodes that already have allocations (available devices < total devices)
+		var partiallyAllocatedNumas []int64
+		for numaID, devices := range numaDevices {
+			if len(devices) < totalDevicesPerNuma[numaID] {
+				partiallyAllocatedNumas = append(partiallyAllocatedNumas, numaID)
+			}
+		}
+		m.log.Info("Partially allocated NUMA nodes", "numas", partiallyAllocatedNumas)
+
+		var preferredDevices []string
+
+		// For 1, 2, or 4 cards, try to allocate from the same NUMA node
+		if req.AllocationSize <= 4 {
+			// First try to allocate from already partially allocated NUMA nodes
+			if len(partiallyAllocatedNumas) > 0 {
+				for _, numaID := range partiallyAllocatedNumas {
+					devices := numaDevices[numaID]
+					if len(devices) >= int(req.AllocationSize) {
+						m.log.Info("Allocating from partially allocated NUMA node", "numa_id", numaID,
+							"available", len(devices), "requested", req.AllocationSize)
+
+						for i := 0; i < int(req.AllocationSize); i++ {
+							preferredDevices = append(preferredDevices, devices[i].ID)
+						}
+						break
+					}
+				}
+			}
+
+			// If no partially allocated NUMA node has enough devices, try unallocated NUMA nodes
+			if len(preferredDevices) != int(req.AllocationSize) {
+				for numaID, devices := range numaDevices {
+					// Skip already tried partially allocated NUMA nodes
+					alreadyTried := false
+					for _, allocatedNuma := range partiallyAllocatedNumas {
+						if numaID == allocatedNuma {
+							alreadyTried = true
+							break
+						}
+					}
+					if alreadyTried {
+						continue
+					}
+
+					if len(devices) >= int(req.AllocationSize) {
+						m.log.Info("Found NUMA node with enough devices", "numa_id", numaID,
+							"available", len(devices), "requested", req.AllocationSize)
+
+						// Allocate the requested number of devices
+						for i := 0; i < int(req.AllocationSize); i++ {
+							preferredDevices = append(preferredDevices, devices[i].ID)
+						}
+						break
+					}
+				}
+			}
+
+			// If still couldn't find a suitable NUMA node, fall back to cross-NUMA allocation
+			if len(preferredDevices) != int(req.AllocationSize) {
+				m.log.Warn("Could not allocate requested devices from a single NUMA node, using cross-NUMA allocation",
+					"requested", req.AllocationSize)
+			}
+		}
+
+		// For more than 4 cards or if same-NUMA allocation failed, allocate across NUMA nodes
+		if len(preferredDevices) != int(req.AllocationSize) {
+			m.log.Info("Allocating devices across NUMA nodes", "requested", req.AllocationSize)
+			preferredDevices = allocateAcrossNuma(numaDevices, int(req.AllocationSize))
+		}
+
+		// Final check if we have enough devices
+		if len(preferredDevices) != int(req.AllocationSize) {
+			m.log.Error("Failed to allocate requested number of devices",
+				"requested", req.AllocationSize, "allocated", len(preferredDevices))
+			return nil, fmt.Errorf("could not allocate requested number of devices: requested %d, allocated %d",
+				req.AllocationSize, len(preferredDevices))
+		}
+
+		m.log.Info("Preferred allocation", "devices", preferredDevices)
+		resp := &pluginapi.ContainerPreferredAllocationResponse{
+			DeviceIDs: preferredDevices,
+		}
+
+		response.ContainerResponses = append(response.ContainerResponses, resp)
+	}
+
+	return response, nil
+}
+
+// allocateAcrossNuma allocates devices across NUMA nodes
+func allocateAcrossNuma(numaDevices map[int64][]*pluginapi.Device, count int) []string {
+	result := make([]string, 0, count)
+
+	// Sort NUMA nodes by number of devices (descending)
+	type numaGroup struct {
+		numaID  int64
+		devices []*pluginapi.Device
+	}
+
+	numaGroups := make([]numaGroup, 0, len(numaDevices))
+	for numaID, devices := range numaDevices {
+		numaGroups = append(numaGroups, numaGroup{numaID, devices})
+	}
+
+	// Sort by number of devices (descending)
+	for i := 0; i < len(numaGroups); i++ {
+		for j := i + 1; j < len(numaGroups); j++ {
+			if len(numaGroups[i].devices) < len(numaGroups[j].devices) {
+				numaGroups[i], numaGroups[j] = numaGroups[j], numaGroups[i]
+			}
+		}
+	}
+
+	// Allocate devices from NUMA nodes with the most devices first
+	remaining := count
+	for _, group := range numaGroups {
+		numToAllocate := min(remaining, len(group.devices))
+		for i := 0; i < numToAllocate; i++ {
+			result = append(result, group.devices[i].ID)
+		}
+		remaining -= numToAllocate
+		if remaining == 0 {
+			break
+		}
+	}
+
+	return result
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// groupDevicesByNuma groups devices by their NUMA node
+func groupDevicesByNuma(devices []*pluginapi.Device) map[int64][]*pluginapi.Device {
+	numaDevices := make(map[int64][]*pluginapi.Device)
+
+	for _, device := range devices {
+		var numaID int64 = -1
+		if device.Topology != nil && len(device.Topology.Nodes) > 0 {
+			numaID = device.Topology.Nodes[0].ID
+		}
+
+		numaDevices[numaID] = append(numaDevices[numaID], device)
+	}
+
+	return numaDevices
 }
 
 // NewHabanalabsDevicePlugin returns an initialized HabanalabsDevicePlugin.
@@ -74,7 +255,7 @@ func NewHabanalabsDevicePlugin(log *slog.Logger, resourceManager ResourceManager
 // GetDevicePluginOptions returns the device plugin options.
 func (m *HabanalabsDevicePlugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	return &pluginapi.DevicePluginOptions{
-		GetPreferredAllocationAvailable: false, // Indicate to kubelet we don't have an implementation.
+		GetPreferredAllocationAvailable: true, // Indicate to kubelet we have an implementation.
 	}, nil
 }
 
